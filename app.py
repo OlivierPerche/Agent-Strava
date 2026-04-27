@@ -1,3 +1,6 @@
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 from fastmcp import FastMCP
 import requests
 import os
@@ -26,6 +29,49 @@ def get_recent_activities():
     )
 
     return response.json()
+
+@mcp.tool
+def analyze_last_activity():
+    activities = get_recent_activities()
+    
+    if not activities:
+        return {"error": "No activities found"}
+
+    last = activities[0]
+
+    distance = round(last["distance"] / 1000, 2)
+    duration = round(last["moving_time"] / 60, 1)
+    elevation = last.get("total_elevation_gain", 0)
+
+    prompt = f"""
+    Tu es un coach trail expert.
+
+    Analyse cette sortie :
+    - Distance : {distance} km
+    - Durée : {duration} minutes
+    - D+ : {elevation} m
+
+    Donne :
+    1. Un feedback rapide
+    2. Un point fort
+    3. Un point d’amélioration
+    4. Une recommandation pour la prochaine séance
+
+    Réponse courte et actionnable.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return {
+        "distance_km": distance,
+        "duration_min": duration,
+        "elevation_m": elevation,
+        "analysis": response.choices[0].message.content
+    }
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
