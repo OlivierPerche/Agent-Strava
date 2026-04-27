@@ -1,9 +1,9 @@
-from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 from fastmcp import FastMCP
+from openai import OpenAI
 import requests
 import os
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 mcp = FastMCP("Strava Coach")
 
