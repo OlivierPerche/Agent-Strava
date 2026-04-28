@@ -1,8 +1,18 @@
 from fastmcp import FastMCP
 from openai import OpenAI
+from flask import Flask
 import requests
 import os
 
+app_http = Flask(__name__)
+
+@app_http.route("/analyze")
+def analyze_http():
+    try:
+        return analyze_last_activity()
+    except Exception as e:
+        return {"error": str(e)}
+        
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 mcp = FastMCP("Strava Coach")
