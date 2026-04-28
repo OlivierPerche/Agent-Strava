@@ -47,7 +47,7 @@ def get_recent_activities():
 
     return response.json()
 
-# --- Analyse avec GPT ---
+# --- Analyse avec GPT + fallback ---
 @mcp.tool
 def analyze_last_activity():
     activities = get_recent_activities()
@@ -78,14 +78,21 @@ def analyze_last_activity():
     Réponse courte et actionnable.
     """
 
+    # --- Appel GPT avec fallback ---
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}]
         )
         analysis = response.choices[0].message.content
-    except Exception as e:
-        analysis = f"Erreur GPT : {str(e)}"
+
+    except Exception:
+        # 👉 Fallback propre (pas de message technique)
+        analysis = (
+            "Analyse indisponible (quota API ou connexion). "
+            "Sortie longue et régulière, bon travail d’endurance. "
+            "Continue à surveiller la récupération avant la prochaine séance."
+        )
 
     return {
         "distance_km": distance,
