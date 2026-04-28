@@ -75,4 +75,4 @@ def analyze_last_activity():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    mcp.run(transport="http", host="0.0.0.0", port=port)
+    app_http.run(host="0.0.0.0", port=port)
