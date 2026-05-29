@@ -1,0 +1,12 @@
+# Credentials Google — ne jamais commiter
+credentials.json
+token.json
+
+# Variables d'environnement locales
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

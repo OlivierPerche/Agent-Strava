@@ -1,12 +1,16 @@
 """
-Strava MCP Server
-Expose des outils Strava à Claude via MCP (Streamable HTTP).
+Strava + Google Calendar MCP Server
+Expose des outils Strava et Google Calendar à Claude via MCP (Streamable HTTP).
 """
 from fastmcp import FastMCP
 import requests
 import os
 import time
 from datetime import datetime, timezone
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
 # --- Cache du token Strava en mémoire ---
 _token_cache = {"access_token": None, "expires_at": 0}
@@ -66,6 +70,72 @@ def _summarize_activity(activity: dict) -> dict:
         "max_heartrate": activity.get("max_heartrate"),
         "average_speed_kmh": round(activity.get("average_speed", 0) * 3.6, 2),
         "kudos_count": activity.get("kudos_count"),
+    }
+
+
+# --- Auth Google Calendar ---
+_GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+_google_creds_cache: dict = {"credentials": None}
+
+
+def get_google_credentials() -> Credentials:
+    """
+    Retourne des Credentials Google valides, avec cache et refresh automatique.
+    Même pattern que get_access_token() pour Strava.
+    Variables d'environnement requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+    GOOGLE_REFRESH_TOKEN.
+    """
+    creds: Credentials | None = _google_creds_cache["credentials"]
+
+    if creds and creds.valid:
+        return creds
+
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        _google_creds_cache["credentials"] = creds
+        return creds
+
+    # Première utilisation : construction depuis les variables d'environnement
+    creds = Credentials(
+        token=None,
+        refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=_GOOGLE_SCOPES,
+    )
+    creds.refresh(Request())
+    _google_creds_cache["credentials"] = creds
+    return creds
+
+
+def _get_calendar_service():
+    """Retourne un service Google Calendar v3 authentifié."""
+    return build("calendar", "v3", credentials=get_google_credentials())
+
+
+# --- Helpers Google Calendar ---
+
+def _to_rfc3339(d: str) -> str:
+    """Convertit 'YYYY-MM-DD' en RFC3339 requis par l'API Google Calendar."""
+    if "T" in d:
+        return d if d.endswith("Z") else d + "Z"
+    return f"{d}T00:00:00Z"
+
+
+def _summarize_event(event: dict) -> dict:
+    """Résumé court d'un événement (pour les listes)."""
+    start = event.get("start", {})
+    end = event.get("end", {})
+    return {
+        "id": event.get("id"),
+        "title": event.get("summary"),
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "description": event.get("description"),
+        "location": event.get("location"),
+        "color_id": event.get("colorId"),
+        "status": event.get("status"),
     }
 
 
@@ -195,6 +265,248 @@ def get_athlete_stats() -> dict:
         "all_run_totals": stats.get("all_run_totals"),
         "all_ride_totals": stats.get("all_ride_totals"),
     }
+
+
+# --- Outils Google Calendar : lecture ---
+
+@mcp.tool
+def list_calendars() -> list[dict]:
+    """
+    Liste les agendas Google Calendar disponibles.
+    Utile pour récupérer les calendar_id avant d'appeler les autres outils.
+    """
+    service = _get_calendar_service()
+    result = service.calendarList().list().execute()
+    return [
+        {
+            "id": cal.get("id"),
+            "summary": cal.get("summary"),
+            "primary": cal.get("primary", False),
+            "access_role": cal.get("accessRole"),
+            "time_zone": cal.get("timeZone"),
+        }
+        for cal in result.get("items", [])
+    ]
+
+
+@mcp.tool
+def list_calendar_events(
+    time_min: str,
+    time_max: str,
+    calendar_id: str = "primary",
+    max_results: int = 20,
+) -> list[dict]:
+    """
+    Retourne les événements dans une plage de dates.
+    Args:
+        time_min: début de la plage, format 'YYYY-MM-DD' ou ISO 8601.
+        time_max: fin de la plage, format 'YYYY-MM-DD' ou ISO 8601.
+        calendar_id: identifiant de l'agenda (défaut : 'primary').
+        max_results: nombre max d'événements (défaut : 20, max : 100).
+    """
+    service = _get_calendar_service()
+    result = (
+        service.events()
+        .list(
+            calendarId=calendar_id,
+            timeMin=_to_rfc3339(time_min),
+            timeMax=_to_rfc3339(time_max),
+            maxResults=min(max_results, 100),
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    return [_summarize_event(e) for e in result.get("items", [])]
+
+
+@mcp.tool
+def get_calendar_event(
+    event_id: str,
+    calendar_id: str = "primary",
+) -> dict:
+    """
+    Retourne le détail complet d'un événement Calendar.
+    Args:
+        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        calendar_id: identifiant de l'agenda (défaut : 'primary').
+    """
+    service = _get_calendar_service()
+    event = service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    start = event.get("start", {})
+    end = event.get("end", {})
+    return {
+        "id": event.get("id"),
+        "title": event.get("summary"),
+        "start": start.get("dateTime") or start.get("date"),
+        "end": end.get("dateTime") or end.get("date"),
+        "description": event.get("description"),
+        "location": event.get("location"),
+        "color_id": event.get("colorId"),
+        "status": event.get("status"),
+        "recurrence": event.get("recurrence"),
+        "reminders": event.get("reminders"),
+        "attendees": [
+            {
+                "email": a.get("email"),
+                "display_name": a.get("displayName"),
+                "response_status": a.get("responseStatus"),
+            }
+            for a in event.get("attendees", [])
+        ],
+        "html_link": event.get("htmlLink"),
+        "creator": event.get("creator", {}).get("email"),
+        "created": event.get("created"),
+        "updated": event.get("updated"),
+    }
+
+
+# --- Outils Google Calendar : écriture ---
+
+_TRAINING_TYPE_COLORS = {
+    "footing":        "7",   # Bleu paon       — endurance de base
+    "sortie_longue":  "9",   # Bleuet          — endurance longue
+    "fractionne":     "11",  # Rouge tomate     — intensité
+    "recup":          "2",   # Sauge            — récupération
+    "renfo":          "5",   # Banane           — renforcement
+    "competition":    "6",   # Mandarine        — événement clé
+    "repos":          "8",   # Graphite         — repos
+}
+
+
+@mcp.tool
+def create_calendar_event(
+    title: str,
+    start: str,
+    end: str,
+    calendar_id: str = "primary",
+    description: str | None = None,
+    location: str | None = None,
+    training_type: str | None = None,
+) -> dict:
+    """
+    Crée un événement dans Google Calendar.
+    Args:
+        title: titre de l'événement.
+        start: début ISO 8601 ('YYYY-MM-DD' ou 'YYYY-MM-DDTHH:MM:SS').
+        end: fin ISO 8601.
+        calendar_id: identifiant de l'agenda (défaut : 'primary').
+        description: description libre.
+        location: lieu.
+        training_type: type de séance, mappe vers une couleur Google Calendar.
+            "footing"       → bleu paon  (7)
+            "sortie_longue" → bleuet     (9)
+            "fractionne"    → tomate     (11)
+            "recup"         → sauge      (2)
+            "renfo"         → banane     (5)
+            "competition"   → mandarine  (6)
+            "repos"         → graphite   (8)
+    """
+    def _fmt(d: str) -> dict:
+        if "T" in d:
+            return {"dateTime": d if d.endswith("Z") else d, "timeZone": "Europe/Paris"}
+        return {"date": d}
+
+    body: dict = {
+        "summary": title,
+        "start": _fmt(start),
+        "end": _fmt(end),
+    }
+    if description:
+        body["description"] = description
+    if location:
+        body["location"] = location
+    if training_type and training_type in _TRAINING_TYPE_COLORS:
+        body["colorId"] = _TRAINING_TYPE_COLORS[training_type]
+
+    service = _get_calendar_service()
+    event = service.events().insert(calendarId=calendar_id, body=body).execute()
+    return {
+        "id": event.get("id"),
+        "title": event.get("summary"),
+        "start": event.get("start", {}).get("dateTime") or event.get("start", {}).get("date"),
+        "end": event.get("end", {}).get("dateTime") or event.get("end", {}).get("date"),
+        "html_link": event.get("htmlLink"),
+        "color_id": event.get("colorId"),
+    }
+
+
+@mcp.tool
+def update_calendar_event(
+    event_id: str,
+    calendar_id: str = "primary",
+    title: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    training_type: str | None = None,
+) -> dict:
+    """
+    Met à jour un ou plusieurs champs d'un événement existant (PATCH).
+    Seuls les champs fournis sont modifiés, les autres restent inchangés.
+    Args:
+        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        calendar_id: identifiant de l'agenda (défaut : 'primary').
+        title: nouveau titre. Optionnel.
+        start: nouvelle date/heure de début ISO 8601. Optionnel.
+        end: nouvelle date/heure de fin ISO 8601. Optionnel.
+        description: nouvelle description. Optionnel.
+        location: nouveau lieu. Optionnel.
+        training_type: type de séance (met à jour la couleur). Voir create_calendar_event.
+    """
+    def _fmt(d: str) -> dict:
+        if "T" in d:
+            return {"dateTime": d, "timeZone": "Europe/Paris"}
+        return {"date": d}
+
+    body: dict = {}
+    if title is not None:
+        body["summary"] = title
+    if start is not None:
+        body["start"] = _fmt(start)
+    if end is not None:
+        body["end"] = _fmt(end)
+    if description is not None:
+        body["description"] = description
+    if location is not None:
+        body["location"] = location
+    if training_type is not None and training_type in _TRAINING_TYPE_COLORS:
+        body["colorId"] = _TRAINING_TYPE_COLORS[training_type]
+
+    service = _get_calendar_service()
+    event = (
+        service.events()
+        .patch(calendarId=calendar_id, eventId=event_id, body=body)
+        .execute()
+    )
+    start_val = event.get("start", {})
+    end_val = event.get("end", {})
+    return {
+        "id": event.get("id"),
+        "title": event.get("summary"),
+        "start": start_val.get("dateTime") or start_val.get("date"),
+        "end": end_val.get("dateTime") or end_val.get("date"),
+        "html_link": event.get("htmlLink"),
+        "color_id": event.get("colorId"),
+        "updated": event.get("updated"),
+    }
+
+
+@mcp.tool
+def delete_calendar_event(
+    event_id: str,
+    calendar_id: str = "primary",
+) -> dict:
+    """
+    Supprime un événement Google Calendar.
+    Args:
+        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        calendar_id: identifiant de l'agenda (défaut : 'primary').
+    """
+    service = _get_calendar_service()
+    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+    return {"deleted": True, "event_id": event_id}
 
 
 # --- Lancement serveur ---
