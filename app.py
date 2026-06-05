@@ -74,7 +74,7 @@ def _summarize_activity(activity: dict) -> dict:
 
 
 # --- Auth Google Calendar ---
-_GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+_GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/spreadsheets"]
 _google_creds_cache: dict = {"credentials": None}
 
 

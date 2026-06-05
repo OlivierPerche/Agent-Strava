@@ -19,7 +19,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 import json
 import os
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/spreadsheets"]
 CREDENTIALS_FILE = "credentials.json"
 
 
