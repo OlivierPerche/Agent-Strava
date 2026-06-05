@@ -508,6 +508,94 @@ def delete_calendar_event(
     service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
     return {"deleted": True, "event_id": event_id}
 
+# ============================================================
+# GOOGLE SHEETS TOOLS
+# ============================================================
+
+def get_sheets_service():
+    """Crée le service Google Sheets API."""
+    creds = get_google_credentials()
+    return build("sheets", "v4", credentials=creds)
+
+@mcp.tool()
+def get_sheet_values(spreadsheet_id: str, range_name: str) -> str:
+    """Lit une plage de cellules dans un Google Sheet.
+    Args:
+        spreadsheet_id: ID du spreadsheet (dans l'URL après /d/)
+        range_name: Plage au format A1 ex: 'SÉANCES!A1:N100'
+    """
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get("values", [])
+        return json.dumps(values, ensure_ascii=False)
+    except Exception as e:
+        return f"Erreur: {str(e)}"
+
+@mcp.tool()
+def update_sheet_values(spreadsheet_id: str, range_name: str, values: list) -> str:
+    """Écrit des valeurs dans une plage de cellules.
+    Args:
+        spreadsheet_id: ID du spreadsheet
+        range_name: Plage cible ex: 'SÉANCES!A3:N3'
+        values: Liste de listes [[row1col1, row1col2], [row2col1, ...]]
+    """
+    try:
+        service = get_sheets_service()
+        body = {"values": values}
+        result = service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="USER_ENTERED",
+            body=body
+        ).execute()
+        return f"OK — {result.get('updatedCells')} cellules mises à jour"
+    except Exception as e:
+        return f"Erreur: {str(e)}"
+
+@mcp.tool()
+def append_sheet_row(spreadsheet_id: str, sheet_name: str, values: list) -> str:
+    """Ajoute une ligne à la fin d'un onglet.
+    Args:
+        spreadsheet_id: ID du spreadsheet
+        sheet_name: Nom de l'onglet ex: 'SÉANCES'
+        values: Liste de valeurs [col1, col2, ...]
+    """
+    try:
+        service = get_sheets_service()
+        body = {"values": [values]}
+        result = service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+        return f"OK — ligne ajoutée dans {sheet_name}"
+    except Exception as e:
+        return f"Erreur: {str(e)}"
+
+@mcp.tool()
+def get_spreadsheet_info(spreadsheet_id: str) -> str:
+    """Retourne les métadonnées d'un spreadsheet (titre, liste des onglets).
+    Args:
+        spreadsheet_id: ID du spreadsheet
+    """
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id
+        ).execute()
+        sheets = [s["properties"]["title"] for s in result.get("sheets", [])]
+        return json.dumps({
+            "title": result.get("properties", {}).get("title"),
+            "sheets": sheets
+        }, ensure_ascii=False)
+    except Exception as e:
+        return f"Erreur: {str(e)}"
 
 # --- Lancement serveur ---
 if __name__ == "__main__":
