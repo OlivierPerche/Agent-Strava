@@ -5,6 +5,7 @@ Expose des outils Strava et Google Calendar à Claude via MCP (Streamable HTTP).
 from fastmcp import FastMCP
 import requests
 import os
+import json
 import time
 from datetime import datetime, timezone
 
