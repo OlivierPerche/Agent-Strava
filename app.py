@@ -2,20 +2,19 @@
 Strava + Google Calendar MCP Server
 Expose des outils Strava et Google Calendar à Claude via MCP (Streamable HTTP).
 """
+
 from fastmcp import FastMCP
 import requests
 import os
 import json
 import time
 from datetime import datetime, timezone
-
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 # --- Cache du token Strava en mémoire ---
 _token_cache = {"access_token": None, "expires_at": 0}
-
 
 def get_access_token() -> str:
     """
@@ -38,7 +37,6 @@ def get_access_token() -> str:
     )
     response.raise_for_status()
     data = response.json()
-
     _token_cache["access_token"] = data["access_token"]
     _token_cache["expires_at"] = data.get("expires_at", time.time() + 3600)
     return data["access_token"]
@@ -74,17 +72,19 @@ def _summarize_activity(activity: dict) -> dict:
     }
 
 
-# --- Auth Google Calendar ---
+# --- Auth Google ---
 _GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/spreadsheets"]
 _google_creds_cache: dict = {"credentials": None}
+
+# CORRECTION : cache des services Google pour éviter le rechargement
+# du schéma JSON à chaque appel (cause principale des crashes mémoire)
+_sheets_service_cache = None
+_calendar_service_cache = None
 
 
 def get_google_credentials() -> Credentials:
     """
     Retourne des Credentials Google valides, avec cache et refresh automatique.
-    Même pattern que get_access_token() pour Strava.
-    Variables d'environnement requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-    GOOGLE_REFRESH_TOKEN.
     """
     creds: Credentials | None = _google_creds_cache["credentials"]
 
@@ -96,14 +96,13 @@ def get_google_credentials() -> Credentials:
         _google_creds_cache["credentials"] = creds
         return creds
 
-    # Première utilisation : construction depuis les variables d'environnement
     creds = Credentials(
         token=None,
         refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
         client_id=os.getenv("GOOGLE_CLIENT_ID"),
         client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
         token_uri="https://oauth2.googleapis.com/token",
-            scopes=_GOOGLE_SCOPES,
+        scopes=_GOOGLE_SCOPES,
     )
     creds.refresh(Request())
     _google_creds_cache["credentials"] = creds
@@ -111,12 +110,22 @@ def get_google_credentials() -> Credentials:
 
 
 def _get_calendar_service():
-    """Retourne un service Google Calendar v3 authentifié."""
-    return build("calendar", "v3", credentials=get_google_credentials())
+    """Retourne un service Google Calendar v3 authentifié — mis en cache."""
+    global _calendar_service_cache
+    if _calendar_service_cache is None:
+        _calendar_service_cache = build("calendar", "v3", credentials=get_google_credentials())
+    return _calendar_service_cache
+
+
+def get_sheets_service():
+    """Retourne un service Google Sheets v4 authentifié — mis en cache."""
+    global _sheets_service_cache
+    if _sheets_service_cache is None:
+        _sheets_service_cache = build("sheets", "v4", credentials=get_google_credentials())
+    return _sheets_service_cache
 
 
 # --- Helpers Google Calendar ---
-
 def _to_rfc3339(d: str) -> str:
     """Convertit 'YYYY-MM-DD' en RFC3339 requis par l'API Google Calendar."""
     if "T" in d:
@@ -148,6 +157,7 @@ mcp = FastMCP("Strava Coach")
 def get_recent_activities(per_page: int = 10) -> list[dict]:
     """
     Retourne les N dernières activités de l'athlète (résumé).
+
     Args:
         per_page: nombre d'activités à retourner (max 30 recommandé).
     """
@@ -164,6 +174,7 @@ def get_activities_by_date_range(
 ) -> list[dict]:
     """
     Retourne les activités dans une plage de dates.
+
     Args:
         after: date ISO 'YYYY-MM-DD' (inclusive).
         before: date ISO 'YYYY-MM-DD' (inclusive). Optionnel.
@@ -175,6 +186,7 @@ def get_activities_by_date_range(
     params = {"per_page": min(per_page, 100), "after": _to_epoch(after)}
     if before:
         params["before"] = _to_epoch(before)
+
     activities = _strava_get("/athlete/activities", params)
     return [_summarize_activity(a) for a in activities]
 
@@ -183,11 +195,11 @@ def get_activities_by_date_range(
 def get_activity_details(activity_id: int) -> dict:
     """
     Retourne tous les détails d'une activité : splits, segments, FC, allure, etc.
+
     Args:
         activity_id: ID Strava de l'activité (obtenu via get_recent_activities).
     """
     activity = _strava_get(f"/activities/{activity_id}")
-    # On garde l'essentiel utile à l'analyse
     return {
         "id": activity.get("id"),
         "name": activity.get("name"),
@@ -207,7 +219,7 @@ def get_activity_details(activity_id: int) -> dict:
         "average_cadence": activity.get("average_cadence"),
         "average_watts": activity.get("average_watts"),
         "weighted_average_watts": activity.get("weighted_average_watts"),
-        "splits_metric": activity.get("splits_metric"),  # splits au km
+        "splits_metric": activity.get("splits_metric"),
         "laps": [
             {
                 "lap_index": lap.get("lap_index"),
@@ -229,14 +241,14 @@ def get_activity_streams(
 ) -> dict:
     """
     Retourne les streams (séries temporelles seconde par seconde) d'une activité.
-    Utile pour analyser fractionnés, dérive cardiaque, etc.
+
     Args:
         activity_id: ID Strava de l'activité.
         keys: types de streams. Défaut: time, distance, heartrate, velocity_smooth, altitude.
-              Autres: cadence, watts, temp, moving, grade_smooth.
     """
     if keys is None:
         keys = ["time", "distance", "heartrate", "velocity_smooth", "altitude"]
+
     streams = _strava_get(
         f"/activities/{activity_id}/streams",
         {"keys": ",".join(keys), "key_by_type": "true"},
@@ -246,9 +258,7 @@ def get_activity_streams(
 
 @mcp.tool
 def get_athlete_stats() -> dict:
-    """
-    Retourne les stats globales de l'athlète (totaux récents et all-time).
-    """
+    """Retourne les stats globales de l'athlète (totaux récents et all-time)."""
     athlete = _strava_get("/athlete")
     athlete_id = athlete["id"]
     stats = _strava_get(f"/athletes/{athlete_id}/stats")
@@ -272,10 +282,7 @@ def get_athlete_stats() -> dict:
 
 @mcp.tool
 def list_calendars() -> list[dict]:
-    """
-    Liste les agendas Google Calendar disponibles.
-    Utile pour récupérer les calendar_id avant d'appeler les autres outils.
-    """
+    """Liste les agendas Google Calendar disponibles."""
     service = _get_calendar_service()
     result = service.calendarList().list().execute()
     return [
@@ -299,6 +306,7 @@ def list_calendar_events(
 ) -> list[dict]:
     """
     Retourne les événements dans une plage de dates.
+
     Args:
         time_min: début de la plage, format 'YYYY-MM-DD' ou ISO 8601.
         time_max: fin de la plage, format 'YYYY-MM-DD' ou ISO 8601.
@@ -328,8 +336,9 @@ def get_calendar_event(
 ) -> dict:
     """
     Retourne le détail complet d'un événement Calendar.
+
     Args:
-        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        event_id: identifiant de l'événement.
         calendar_id: identifiant de l'agenda (défaut : 'primary').
     """
     service = _get_calendar_service()
@@ -365,13 +374,13 @@ def get_calendar_event(
 # --- Outils Google Calendar : écriture ---
 
 _TRAINING_TYPE_COLORS = {
-    "footing":        "7",   # Bleu paon       — endurance de base
-    "sortie_longue":  "9",   # Bleuet          — endurance longue
-    "fractionne":     "11",  # Rouge tomate     — intensité
-    "recup":          "2",   # Sauge            — récupération
-    "renfo":          "5",   # Banane           — renforcement
-    "competition":    "6",   # Mandarine        — événement clé
-    "repos":          "8",   # Graphite         — repos
+    "footing": "7",        # Bleu paon
+    "sortie_longue": "9",  # Bleuet
+    "fractionne": "11",    # Rouge tomate
+    "recup": "2",          # Sauge
+    "renfo": "5",          # Banane
+    "competition": "6",    # Mandarine
+    "repos": "8",          # Graphite
 }
 
 
@@ -387,6 +396,7 @@ def create_calendar_event(
 ) -> dict:
     """
     Crée un événement dans Google Calendar.
+
     Args:
         title: titre de l'événement.
         start: début ISO 8601 ('YYYY-MM-DD' ou 'YYYY-MM-DDTHH:MM:SS').
@@ -394,14 +404,7 @@ def create_calendar_event(
         calendar_id: identifiant de l'agenda (défaut : 'primary').
         description: description libre.
         location: lieu.
-        training_type: type de séance, mappe vers une couleur Google Calendar.
-            "footing"       → bleu paon  (7)
-            "sortie_longue" → bleuet     (9)
-            "fractionne"    → tomate     (11)
-            "recup"         → sauge      (2)
-            "renfo"         → banane     (5)
-            "competition"   → mandarine  (6)
-            "repos"         → graphite   (8)
+        training_type: type de séance → couleur auto.
     """
     def _fmt(d: str) -> dict:
         if "T" in d:
@@ -445,16 +448,11 @@ def update_calendar_event(
 ) -> dict:
     """
     Met à jour un ou plusieurs champs d'un événement existant (PATCH).
-    Seuls les champs fournis sont modifiés, les autres restent inchangés.
+
     Args:
-        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        event_id: identifiant de l'événement.
         calendar_id: identifiant de l'agenda (défaut : 'primary').
-        title: nouveau titre. Optionnel.
-        start: nouvelle date/heure de début ISO 8601. Optionnel.
-        end: nouvelle date/heure de fin ISO 8601. Optionnel.
-        description: nouvelle description. Optionnel.
-        location: nouveau lieu. Optionnel.
-        training_type: type de séance (met à jour la couleur). Voir create_calendar_event.
+        title, start, end, description, location, training_type: champs optionnels.
     """
     def _fmt(d: str) -> dict:
         if "T" in d:
@@ -501,26 +499,24 @@ def delete_calendar_event(
 ) -> dict:
     """
     Supprime un événement Google Calendar.
+
     Args:
-        event_id: identifiant de l'événement (obtenu via list_calendar_events).
+        event_id: identifiant de l'événement.
         calendar_id: identifiant de l'agenda (défaut : 'primary').
     """
     service = _get_calendar_service()
     service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
     return {"deleted": True, "event_id": event_id}
 
+
 # ============================================================
 # GOOGLE SHEETS TOOLS
 # ============================================================
 
-def get_sheets_service():
-    """Crée le service Google Sheets API."""
-    creds = get_google_credentials()
-    return build("sheets", "v4", credentials=creds)
-
 @mcp.tool()
 def get_sheet_values(spreadsheet_id: str, range_name: str) -> str:
     """Lit une plage de cellules dans un Google Sheet.
+
     Args:
         spreadsheet_id: ID du spreadsheet (dans l'URL après /d/)
         range_name: Plage au format A1 ex: 'SÉANCES!A1:N100'
@@ -536,9 +532,11 @@ def get_sheet_values(spreadsheet_id: str, range_name: str) -> str:
     except Exception as e:
         return f"Erreur: {str(e)}"
 
+
 @mcp.tool()
 def update_sheet_values(spreadsheet_id: str, range_name: str, values: list) -> str:
     """Écrit des valeurs dans une plage de cellules.
+
     Args:
         spreadsheet_id: ID du spreadsheet
         range_name: Plage cible ex: 'SÉANCES!A3:N3'
@@ -557,9 +555,11 @@ def update_sheet_values(spreadsheet_id: str, range_name: str, values: list) -> s
     except Exception as e:
         return f"Erreur: {str(e)}"
 
+
 @mcp.tool()
 def append_sheet_row(spreadsheet_id: str, sheet_name: str, values: list) -> str:
     """Ajoute une ligne à la fin d'un onglet.
+
     Args:
         spreadsheet_id: ID du spreadsheet
         sheet_name: Nom de l'onglet ex: 'SÉANCES'
@@ -579,9 +579,11 @@ def append_sheet_row(spreadsheet_id: str, sheet_name: str, values: list) -> str:
     except Exception as e:
         return f"Erreur: {str(e)}"
 
+
 @mcp.tool()
 def get_spreadsheet_info(spreadsheet_id: str) -> str:
     """Retourne les métadonnées d'un spreadsheet (titre, liste des onglets).
+
     Args:
         spreadsheet_id: ID du spreadsheet
     """
@@ -598,9 +600,8 @@ def get_spreadsheet_info(spreadsheet_id: str) -> str:
     except Exception as e:
         return f"Erreur: {str(e)}"
 
+
 # --- Lancement serveur ---
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
-
-
