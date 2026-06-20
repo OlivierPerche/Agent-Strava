@@ -663,7 +663,25 @@ def get_spreadsheet_info(spreadsheet_id: str) -> str:
         return f"Erreur: {str(e)}"
 
 
+# --- Health check endpoint (pour UptimeRobot / keep-alive) ---
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+async def health(request):
+    return JSONResponse({"status": "ok", "service": "strava-coach-mcp"})
+
+# Monter le health check sur l'app Starlette sous-jacente de FastMCP
+def create_app():
+    mcp_app = mcp.http_app(path="/mcp")
+    app = Starlette(
+        routes=[Route("/health", health)],
+    )
+    app.mount("/", mcp_app)
+    return app
+
 # --- Lancement serveur ---
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
+    uvicorn.run(create_app(), host="0.0.0.0", port=port)
