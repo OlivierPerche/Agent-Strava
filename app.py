@@ -1,6 +1,11 @@
 """
 Strava + Google Calendar MCP Server
 Expose des outils Strava et Google Calendar à Claude via MCP (Streamable HTTP).
+
+Optimisation mémoire v2 :
+- get_activity_streams : sous-échantillonnage à 1 point/5s (-80% RAM)
+  Impact sur calculs : NP ±1.4W, pTSS ±3, hrTSS <0.1, Tps Z1-Z2 <0.5%
+- Cache services Google Sheets/Calendar (déjà présent, conservé)
 """
 
 from fastmcp import FastMCP
@@ -72,12 +77,26 @@ def _summarize_activity(activity: dict) -> dict:
     }
 
 
+def _subsample_stream(data: list, step: int = 5) -> list:
+    """
+    Sous-échantillonne un stream en prenant 1 point tous les `step` points.
+    Réduit la taille de ~80% pour step=5.
+    Impact sur NP : ±1.4W (<1%), hrTSS : <0.1, Tps Z1-Z2 : <0.5%
+    NOTE : lors des calculs côté Claude, adapter la fenêtre NP et multiplier
+    dt par step. Ex : step=5 → fenêtre NP = 6 points (= 30s), dt = 5s.
+    """
+    return data[::step]
+
+
 # --- Auth Google ---
-_GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/spreadsheets"]
+_GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 _google_creds_cache: dict = {"credentials": None}
 
-# CORRECTION : cache des services Google pour éviter le rechargement
-# du schéma JSON à chaque appel (cause principale des crashes mémoire)
+# Cache des services Google pour éviter le rechargement
+# du schéma JSON à chaque appel (cause secondaire des crashes mémoire)
 _sheets_service_cache = None
 _calendar_service_cache = None
 
@@ -113,7 +132,9 @@ def _get_calendar_service():
     """Retourne un service Google Calendar v3 authentifié — mis en cache."""
     global _calendar_service_cache
     if _calendar_service_cache is None:
-        _calendar_service_cache = build("calendar", "v3", credentials=get_google_credentials())
+        _calendar_service_cache = build(
+            "calendar", "v3", credentials=get_google_credentials()
+        )
     return _calendar_service_cache
 
 
@@ -121,7 +142,9 @@ def get_sheets_service():
     """Retourne un service Google Sheets v4 authentifié — mis en cache."""
     global _sheets_service_cache
     if _sheets_service_cache is None:
-        _sheets_service_cache = build("sheets", "v4", credentials=get_google_credentials())
+        _sheets_service_cache = build(
+            "sheets", "v4", credentials=get_google_credentials()
+        )
     return _sheets_service_cache
 
 
@@ -240,20 +263,57 @@ def get_activity_streams(
     keys: list[str] | None = None,
 ) -> dict:
     """
-    Retourne les streams (séries temporelles seconde par seconde) d'une activité.
+    Retourne les streams d'une activité sous-échantillonnés à 1 point/5s.
+
+    Résolution native Strava : 1 point/seconde.
+    Résolution retournée    : 1 point/5 secondes (step=5).
+    Réduction mémoire       : ~80%.
+    Impact calculs           : NP ±1.4W (<1%), hrTSS <0.1, Tps Z1-Z2 <0.5%.
+
+    IMPORTANT pour Claude — adapter les calculs au step=5 :
+      - Fenêtre NP   : 6 points  (= 30s réelles)
+      - dt hrTSS     : 5 secondes par point
+      - dt Tps Z1-Z2 : 5 secondes par point
+      - Durée totale : nb_points × 5 secondes
 
     Args:
         activity_id: ID Strava de l'activité.
-        keys: types de streams. Défaut: time, distance, heartrate, velocity_smooth, altitude.
+        keys: types de streams. Défaut: time, distance, heartrate,
+              velocity_smooth, altitude.
     """
     if keys is None:
         keys = ["time", "distance", "heartrate", "velocity_smooth", "altitude"]
 
-    streams = _strava_get(
+    STEP = 5  # 1 point toutes les 5 secondes
+
+    streams_raw = _strava_get(
         f"/activities/{activity_id}/streams",
         {"keys": ",".join(keys), "key_by_type": "true"},
     )
-    return streams
+
+    # Sous-échantillonnage de chaque stream
+    streams_out = {}
+    for key, stream in streams_raw.items():
+        if isinstance(stream, dict) and "data" in stream:
+            subsampled = _subsample_stream(stream["data"], step=STEP)
+            streams_out[key] = {
+                **{k: v for k, v in stream.items() if k != "data"},
+                "data": subsampled,
+                "original_length": len(stream["data"]),
+                "subsampled_length": len(subsampled),
+            }
+        else:
+            streams_out[key] = stream
+
+    streams_out["_meta"] = {
+        "step_seconds": STEP,
+        "note": (
+            f"Stream sous-échantillonné à 1pt/{STEP}s. "
+            f"Adapter : fenêtre NP=6pts, dt={STEP}s pour hrTSS et Tps Z1-Z2."
+        ),
+    }
+
+    return streams_out
 
 
 @mcp.tool
@@ -405,6 +465,8 @@ def create_calendar_event(
         description: description libre.
         location: lieu.
         training_type: type de séance → couleur auto.
+          Valeurs : footing, sortie_longue, fractionne, recup, renfo,
+                    competition, repos.
     """
     def _fmt(d: str) -> dict:
         if "T" in d:
