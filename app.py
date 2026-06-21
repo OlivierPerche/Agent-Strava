@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 # --- Cache du token Strava en mémoire ---
 _token_cache = {"access_token": None, "expires_at": 0}
@@ -663,22 +666,21 @@ def get_spreadsheet_info(spreadsheet_id: str) -> str:
         return f"Erreur: {str(e)}"
 
 
-# --- Health check endpoint (pour UptimeRobot / keep-alive) ---
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
+# --- Health check endpoint ---
 async def health(request):
     return JSONResponse({"status": "ok", "service": "strava-coach-mcp"})
 
-# Monter le health check sur l'app Starlette sous-jacente de FastMCP
+
+# --- Factory ASGI avec lifespan FastMCP correctement transmis ---
 def create_app():
     mcp_app = mcp.http_app(path="/mcp")
     app = Starlette(
+        lifespan=mcp_app.router.lifespan_context,  # ← FIX : transmet le lifespan FastMCP
         routes=[Route("/health", health)],
     )
     app.mount("/", mcp_app)
     return app
+
 
 # --- Lancement serveur ---
 if __name__ == "__main__":
